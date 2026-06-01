@@ -443,25 +443,53 @@ async function migrateOldSettings(workspaceRoot: string): Promise<void> {
   }
 }
 
-// Resolve the path of .git/info/exclude, handling both a normal repo (.git is a
-// directory) and worktrees/submodules (.git is a file pointing at the real git dir).
-// Returns null when the folder is not a git repository.
+// Resolve the "original clone" root that owns the ignore list. For a jj workspace the
+// opened folder has no .git of its own — .jj/repo is a (usually relative) pointer to the
+// backing repo's .jj/repo, whose grandparent is the clone. The ignore must be applied
+// there, or jj (which evaluates ignores relative to each workspace root) will still see
+// the file even though git already ignores the nested workspace directory.
+function resolveOriginalCloneRoot(workspaceRoot: string): string {
+  const jjRepo = path.join(workspaceRoot, '.jj', 'repo');
+  try {
+    if (fs.statSync(jjRepo).isFile()) {
+      const pointer = fs.readFileSync(jjRepo, 'utf8').trim();
+      const resolved = path.isAbsolute(pointer)
+        ? pointer
+        : path.resolve(path.join(workspaceRoot, '.jj'), pointer);
+      // resolved === <clone>/.jj/repo  →  clone === dirname(dirname(resolved))
+      return path.dirname(path.dirname(resolved));
+    }
+  } catch { /* no .jj/repo, or unreadable — this is the clone itself */ }
+  return workspaceRoot;
+}
+
+// Resolve the path of .git/info/exclude for the clone backing the opened folder.
+// Handles a normal repo (.git is a directory), git worktrees/submodules (.git is a file
+// pointing at the real git dir, whose shared exclude lives in the common dir), and jj
+// workspaces (resolved to the original clone first). Returns null when no git repo.
 function resolveGitInfoExcludePath(workspaceRoot: string): string | null {
-  const dotGit = path.join(workspaceRoot, '.git');
-  let gitDir: string;
+  const cloneRoot = resolveOriginalCloneRoot(workspaceRoot);
+  const dotGit = path.join(cloneRoot, '.git');
   try {
     if (fs.statSync(dotGit).isDirectory()) {
-      gitDir = dotGit;
-    } else {
-      const match = fs.readFileSync(dotGit, 'utf8').match(/^gitdir:\s*(.+)$/m);
-      if (!match) { return null; }
-      const target = match[1].trim();
-      gitDir = path.isAbsolute(target) ? target : path.join(workspaceRoot, target);
+      return path.join(dotGit, 'info', 'exclude');
     }
+    const match = fs.readFileSync(dotGit, 'utf8').match(/^gitdir:\s*(.+)$/m);
+    if (!match) { return null; }
+    const target = match[1].trim();
+    const gitDir = path.isAbsolute(target) ? target : path.join(cloneRoot, target);
+    // A worktree's gitdir has a `commondir` file pointing at the shared git dir, where
+    // the repo-wide exclude lives. Without it, fall back to this gitdir's own exclude.
+    const commonDirFile = path.join(gitDir, 'commondir');
+    if (fs.existsSync(commonDirFile)) {
+      const common = fs.readFileSync(commonDirFile, 'utf8').trim();
+      const commonDir = path.isAbsolute(common) ? common : path.join(gitDir, common);
+      return path.join(commonDir, 'info', 'exclude');
+    }
+    return path.join(gitDir, 'info', 'exclude');
   } catch {
     return null;
   }
-  return path.join(gitDir, 'info', 'exclude');
 }
 
 // Append an entry to .git/info/exclude (local, never-committed ignore list) if not
@@ -541,6 +569,57 @@ function extractColorSettingsFromSettingsFile(workspaceRoot: string): Record<str
   return moved;
 }
 
+// Find a .code-workspace file in the folder root to (re)open as a workspace.
+// Prefers <folder>.code-workspace (the name this extension creates); otherwise
+// returns a single unambiguous *.code-workspace. Null when none / ambiguous.
+function findWorkspaceFileInFolder(workspaceRoot: string): string | null {
+  if (!workspaceRoot) {
+    return null;
+  }
+  const named = path.join(workspaceRoot, `${path.basename(workspaceRoot)}.code-workspace`);
+  if (fs.existsSync(named)) {
+    return named;
+  }
+  try {
+    const matches = fs.readdirSync(workspaceRoot).filter(name => name.endsWith('.code-workspace'));
+    if (matches.length === 1) {
+      return path.join(workspaceRoot, matches[0]);
+    }
+  } catch { /* unreadable directory — ignore */ }
+  return null;
+}
+
+// A single-folder window whose folder is a repository root (contains .git or .jj) — the
+// condition under which we auto-create a workspace file.
+function isSingleFolderRepoRoot(workspaceRoot: string): boolean {
+  if (!workspaceRoot || workspace.workspaceFolders?.length !== 1) {
+    return false;
+  }
+  return fs.existsSync(path.join(workspaceRoot, '.git')) ||
+    fs.existsSync(path.join(workspaceRoot, '.jj'));
+}
+
+// Create a skeleton <folder>.code-workspace and add it to the clone's git exclude.
+// The ignore entry is written BEFORE the file: jj tracks any file present when it next
+// snapshots, and adding an ignore afterward will not untrack it (ignores only suppress
+// untracked files). If the ignore can't be resolved we skip creation entirely, so a
+// silent auto-create never pollutes the working copy. Unlike the explicit command, this
+// does NOT touch .vscode/settings.json — colors are written once the workspace is opened.
+// Returns the path, or null on failure.
+function createGitignoredWorkspaceFile(workspaceRoot: string): string | null {
+  const fileName = `${path.basename(workspaceRoot)}.code-workspace`;
+  const filePath = path.join(workspaceRoot, fileName);
+  if (!addToGitExclude(workspaceRoot, fileName)) {
+    return null;
+  }
+  try {
+    fs.writeFileSync(filePath, JSON.stringify({ folders: [{ path: '.' }], settings: {} }, null, 2) + '\n');
+  } catch {
+    return null;
+  }
+  return filePath;
+}
+
 export function activate(context: ExtensionContext) {
 
   if (!workspace.workspaceFolders) {
@@ -549,11 +628,37 @@ export function activate(context: ExtensionContext) {
 
   const workspaceRoot: string = getWorkspaceFolder(workspace.workspaceFolders);
 
-  // Migrate old emoji-prefixed settings before applying colors
-  migrateOldSettings(workspaceRoot).then(() => applyWindowColors(workspaceRoot)).then(computedColors => {
-    const settingsFileDeleter = new SettingsFileDeleter(workspaceRoot, computedColors);
-    context.subscriptions.push(settingsFileDeleter);
-  });
+  // When a plain folder is opened (not any workspace), reopen it as a workspace so colors
+  // are written to the gitignored workspace file rather than .vscode/settings.json. Use an
+  // existing matching .code-workspace if present; otherwise, for a single-folder repo root,
+  // create and gitignore one first. Guarded by !workspace.workspaceFile so it can never
+  // loop once reopened as a workspace.
+  if (!workspace.workspaceFile &&
+      (workspace.getConfiguration('windowColors').get<boolean>('autoOpenWorkspaceFile') ?? true)) {
+    // Always look for an existing file first, so auto-create never overwrites one.
+    let workspaceFile = findWorkspaceFileInFolder(workspaceRoot);
+    if (!workspaceFile &&
+        (workspace.getConfiguration('windowColors').get<boolean>('autoCreateWorkspaceFile') ?? true) &&
+        isSingleFolderRepoRoot(workspaceRoot)) {
+      // Returns null (skips creation) if the ignore can't be resolved — no silent pollution.
+      workspaceFile = createGitignoredWorkspaceFile(workspaceRoot);
+    }
+    if (workspaceFile) {
+      commands.executeCommand('vscode.openFolder', Uri.file(workspaceFile), { forceReuseWindow: true });
+      return;
+    }
+  }
+
+  // Auto-apply colors on open ONLY in workspace mode, where they are written to the
+  // gitignored .code-workspace file. In plain folder mode we never write automatically —
+  // that would modify a committed .vscode/settings.json. Use "Reset Colors" to apply
+  // colors manually there. Migration also touches settings.json, so it is gated too.
+  if (isSavedWorkspace()) {
+    migrateOldSettings(workspaceRoot).then(() => applyWindowColors(workspaceRoot)).then(computedColors => {
+      const settingsFileDeleter = new SettingsFileDeleter(workspaceRoot, computedColors);
+      context.subscriptions.push(settingsFileDeleter);
+    });
+  }
 
   // One-time update notice for users migrating from the old emoji-key versions
   const noticeKey = 'shownUpdateNotice__1_2_9_feb25_4';
@@ -578,9 +683,14 @@ export function activate(context: ExtensionContext) {
     showUpdateNotice();
   }
 
-  // Re-apply colors when VS Code's color theme changes (matters when Theme is "auto")
+  // Re-apply colors when VS Code's color theme changes (matters when Theme is "auto").
+  // Gated to workspace mode for the same reason as the on-open apply: never write to a
+  // committed .vscode/settings.json automatically.
   context.subscriptions.push(
     window.onDidChangeActiveColorTheme(() => {
+      if (!isSavedWorkspace()) {
+        return;
+      }
       const themeSetting = workspace.getConfiguration('windowColors').get<string>('theme');
       if (!themeSetting || themeSetting === 'auto') {
         applyWindowColors(workspaceRoot);
@@ -966,6 +1076,10 @@ export function activate(context: ExtensionContext) {
       workspaceFile.settings['workbench.colorCustomizations'] = { ...existingColors, ...movedColors };
     }
 
+    // Ignore before writing: jj tracks any file present when it next snapshots, and
+    // adding an ignore afterward won't untrack it. (No-op if it already exists/was ignored.)
+    const ignored = addToGitExclude(workspaceRoot, workspaceFileName);
+
     try {
       fs.writeFileSync(workspaceFilePath, JSON.stringify(workspaceFile, null, 2) + '\n');
     } catch (error) {
@@ -973,9 +1087,8 @@ export function activate(context: ExtensionContext) {
       return;
     }
 
-    const ignored = addToGitExclude(workspaceRoot, workspaceFileName);
     const ignoreNote = ignored
-      ? `Added it to .git/info/exclude so it stays out of version control.`
+      ? `Added it to the repository's git exclude (.git/info/exclude) so it stays out of version control.`
       : `Add "${workspaceFileName}" to your .gitignore so it stays out of version control.`;
 
     const choice = await window.showInformationMessage(

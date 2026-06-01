@@ -102,6 +102,16 @@
           "type": "boolean",
           "default": false,
           "description": "Permanently skip coloring this window. When enabled, Window Colors will not apply or reapply any colors to this workspace."
+        },
+        "windowColors.autoOpenWorkspaceFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "When you open a folder directly, automatically reopen it as a workspace if the folder contains a matching '<folder>.code-workspace' file (or a single '*.code-workspace' file). This promotes the window to workspace mode, where colors are written to the gitignored workspace file instead of '.vscode/settings.json'. Causes one window reload on open.\n\nShould be set in 'User Settings'."
+        },
+        "windowColors.autoCreateWorkspaceFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "When you open a single-folder repository (the folder contains a '.git' or '.jj' directory) that has no workspace file yet, automatically create a gitignored '<folder>.code-workspace' and reopen as that workspace. The ignore entry is written to the backing clone's '.git/info/exclude' (correct for jj workspaces too). Requires 'windowColors.autoOpenWorkspaceFile'. Does not modify '.vscode/settings.json'.\n\nShould be set in 'User Settings'."
         }
       }
     }

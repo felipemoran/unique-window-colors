@@ -48,6 +48,12 @@ Run **`Window Colors: Move Colors to a Gitignored Workspace File`** from the com
 
 Once the window is opened as a workspace, all window colors are written to the gitignored `.code-workspace` file instead of `.vscode/settings.json`. This is the same approach popularized by [Peacock](https://www.peacockcode.dev/guide/) for keeping personal colors out of shared settings.
 
+By default (`windowColors.autoOpenWorkspaceFile`), opening a folder that already contains a matching `.code-workspace` file will reopen it as that workspace automatically, so you don't have to remember to open the workspace file directly. Set it to `false` to disable.
+
+Also by default (`windowColors.autoCreateWorkspaceFile`), opening a single-folder **repository** root (a folder containing `.git` or `.jj`) that has no workspace file yet will create a gitignored `<folder>.code-workspace` and reopen as that workspace — so colors "just work" on any repo you open without ever touching a committed `settings.json`. The ignore entry is written to the backing clone's `.git/info/exclude`, which is resolved correctly for jj workspaces (whose opened folder has no `.git` of its own). Set it to `false` to disable. Both settings belong in your User Settings.
+
+Note: in plain folder mode the extension no longer writes colors automatically — that would modify a committed `.vscode/settings.json`. Use `Window Colors: Reset Colors in This Window` to apply colors manually if you are not using a workspace file.
+
 ## Usage
 
 Colors do not get overwritten.  This allows you to set custom colors (or a single Base Color).  To switch between light and dark themed colors, you must first delete the current colors from `.vscode/settings.json`.  You can do this manually or by or selecting `remove` in the extension's `Window Colors: Theme` settings and reloading the VS Code window.
