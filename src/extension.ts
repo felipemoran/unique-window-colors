@@ -1,8 +1,9 @@
 import * as Color from 'color';
 import * as fs from 'fs';
+import * as path from 'path';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const randomSeed = require('random-seed');
-import { ConfigurationTarget, ExtensionContext, workspace, WorkspaceFolder, commands, window, ColorThemeKind } from 'vscode';
+import { ConfigurationTarget, ExtensionContext, Uri, workspace, WorkspaceFolder, commands, window, ColorThemeKind } from 'vscode';
 
 const MANAGED_COLOR_KEYS = [
   'activityBar.background',
@@ -16,6 +17,28 @@ const MANAGED_COLOR_KEYS = [
   'statusBar.debuggingForeground',
   'statusBar.noFolderBackground',
   'statusBar.noFolderForeground',
+];
+
+// True when the window was opened via a saved .code-workspace file. In that case
+// ConfigurationTarget.Workspace writes go into the workspace file (not
+// .vscode/settings.json), so colors can be kept out of a committed settings.json.
+// An untitled workspace (scheme 'untitled') is intentionally excluded: its settings
+// live in VS Code's internal storage, and we still want the settings-file paths to apply.
+function isSavedWorkspace(): boolean {
+  const workspaceFile = workspace.workspaceFile;
+  return !!workspaceFile && workspaceFile.scheme === 'file';
+}
+
+// The windowColors.* settings the extension manages, used when clearing config
+// via the configuration API (workspace mode) rather than editing settings.json directly.
+const WINDOW_COLORS_SETTING_KEYS = [
+  'theme',
+  'baseColor',
+  'colorTitleBar',
+  'colorActivityBar',
+  'colorStatusBar',
+  'neverColorThisWindow',
+  'deleteSettingsFileUponExit',
 ];
 
 const BASE_COLORS = [
@@ -163,6 +186,12 @@ export class SettingsFileDeleter {
    * Deletes .vscode if no other files exist.
    */
   public dispose() {
+    // In workspace mode colors live in the .code-workspace file, not
+    // .vscode/settings.json, so there is nothing for this cleanup to do.
+    if (isSavedWorkspace()) {
+      return;
+    }
+
     const settingsFile = this.workspaceRoot + '/.vscode/settings.json';
     const vscodeDir = this.workspaceRoot + '/.vscode';
 
@@ -412,6 +441,104 @@ async function migrateOldSettings(workspaceRoot: string): Promise<void> {
       }
     } catch { /* ignore */ }
   }
+}
+
+// Resolve the path of .git/info/exclude, handling both a normal repo (.git is a
+// directory) and worktrees/submodules (.git is a file pointing at the real git dir).
+// Returns null when the folder is not a git repository.
+function resolveGitInfoExcludePath(workspaceRoot: string): string | null {
+  const dotGit = path.join(workspaceRoot, '.git');
+  let gitDir: string;
+  try {
+    if (fs.statSync(dotGit).isDirectory()) {
+      gitDir = dotGit;
+    } else {
+      const match = fs.readFileSync(dotGit, 'utf8').match(/^gitdir:\s*(.+)$/m);
+      if (!match) { return null; }
+      const target = match[1].trim();
+      gitDir = path.isAbsolute(target) ? target : path.join(workspaceRoot, target);
+    }
+  } catch {
+    return null;
+  }
+  return path.join(gitDir, 'info', 'exclude');
+}
+
+// Append an entry to .git/info/exclude (local, never-committed ignore list) if not
+// already present. Returns false when there is no git repo or the write fails.
+function addToGitExclude(workspaceRoot: string, entry: string): boolean {
+  const excludePath = resolveGitInfoExcludePath(workspaceRoot);
+  if (!excludePath) { return false; }
+  try {
+    let content = '';
+    if (fs.existsSync(excludePath)) {
+      content = fs.readFileSync(excludePath, 'utf8');
+    } else {
+      fs.mkdirSync(path.dirname(excludePath), { recursive: true });
+    }
+    if (content.split('\n').some(line => line.trim() === entry)) {
+      return true;
+    }
+    const separator = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
+    fs.appendFileSync(excludePath, `${separator}${entry}\n`);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Move the extension's managed colors and windowColors.* settings out of
+// .vscode/settings.json so they can be written into the workspace file instead.
+// Mutates settings.json in place (deleting it if it becomes empty) and returns the
+// moved entries for the caller to merge into the workspace file's `settings` block.
+function extractColorSettingsFromSettingsFile(workspaceRoot: string): Record<string, unknown> {
+  const settingsFile = path.join(workspaceRoot, '.vscode', 'settings.json');
+  const vscodeDir = path.join(workspaceRoot, '.vscode');
+  const moved: Record<string, unknown> = {};
+
+  if (!fs.existsSync(settingsFile)) {
+    return moved;
+  }
+
+  let fileContent: Record<string, unknown>;
+  try {
+    fileContent = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  } catch {
+    return moved;
+  }
+
+  const colorCustomizations = (fileContent['workbench.colorCustomizations'] as Record<string, unknown>) || {};
+  const movedColors: Record<string, unknown> = {};
+  for (const key of MANAGED_COLOR_KEYS) {
+    if (colorCustomizations[key] !== undefined) {
+      movedColors[key] = colorCustomizations[key];
+      delete colorCustomizations[key];
+    }
+  }
+  if (Object.keys(movedColors).length > 0) {
+    moved['workbench.colorCustomizations'] = movedColors;
+  }
+  if (Object.keys(colorCustomizations).length === 0) {
+    delete fileContent['workbench.colorCustomizations'];
+  } else {
+    fileContent['workbench.colorCustomizations'] = colorCustomizations;
+  }
+
+  for (const key of Object.keys(fileContent)) {
+    if (key.startsWith('windowColors.')) {
+      moved[key] = fileContent[key];
+      delete fileContent[key];
+    }
+  }
+
+  if (Object.keys(fileContent).length === 0) {
+    fs.unlinkSync(settingsFile);
+    try { fs.rmdirSync(vscodeDir); } catch { /* dir not empty, leave it */ }
+  } else {
+    fs.writeFileSync(settingsFile, JSON.stringify(fileContent, null, 2) + '\n');
+  }
+
+  return moved;
 }
 
 export function activate(context: ExtensionContext) {
@@ -725,6 +852,26 @@ export function activate(context: ExtensionContext) {
   context.subscriptions.push(resetColorsDisposable);
 
   const removeColorsDisposable = commands.registerCommand('windowColors.removeColors', async () => {
+    // In workspace mode the colors live in the .code-workspace file. Clear them
+    // through the configuration API, which targets that file rather than .vscode/settings.json.
+    if (isSavedWorkspace()) {
+      const cc = { ...(workspace.getConfiguration('workbench').get('colorCustomizations') as Record<string, string> || {}) };
+      for (const key of MANAGED_COLOR_KEYS) {
+        delete cc[key];
+      }
+      await workspace.getConfiguration('workbench').update('colorCustomizations',
+        Object.keys(cc).length > 0 ? cc : undefined, ConfigurationTarget.Workspace);
+
+      const windowColorsConfig = workspace.getConfiguration('windowColors');
+      for (const key of WINDOW_COLORS_SETTING_KEYS) {
+        if (windowColorsConfig.inspect(key)?.workspaceValue !== undefined) {
+          await windowColorsConfig.update(key, undefined, ConfigurationTarget.Workspace);
+        }
+      }
+      window.showInformationMessage('Window colors removed from the workspace file.');
+      return;
+    }
+
     const settingsFile = workspaceRoot + '/.vscode/settings.json';
     const vscodeDir = workspaceRoot + '/.vscode';
 
@@ -771,6 +918,76 @@ export function activate(context: ExtensionContext) {
   });
 
   context.subscriptions.push(removeColorsDisposable);
+
+  const useWorkspaceFileDisposable = commands.registerCommand('windowColors.useGitignoredWorkspaceFile', async () => {
+    if (isSavedWorkspace()) {
+      window.showInformationMessage(
+        'This window is already opened as a workspace, so Window Colors already writes colors to the workspace file instead of .vscode/settings.json.');
+      return;
+    }
+    if (workspace.workspaceFile) {
+      // Untitled workspace: its settings live in VS Code's internal storage and have no
+      // saveable path we can gitignore. Guide the user to save it first.
+      window.showInformationMessage(
+        'Save this workspace first (File → Save Workspace As…), then add the resulting .code-workspace file to your gitignore.');
+      return;
+    }
+    if (!workspaceRoot) {
+      window.showInformationMessage('No folder is open — cannot create a workspace file.');
+      return;
+    }
+
+    const folderName = path.basename(workspaceRoot);
+    const workspaceFileName = `${folderName}.code-workspace`;
+    const workspaceFilePath = path.join(workspaceRoot, workspaceFileName);
+
+    let workspaceFile: { folders: { path: string }[]; settings: Record<string, unknown> };
+    if (fs.existsSync(workspaceFilePath)) {
+      try {
+        const existing = JSON.parse(fs.readFileSync(workspaceFilePath, 'utf8'));
+        workspaceFile = {
+          folders: Array.isArray(existing.folders) && existing.folders.length > 0 ? existing.folders : [{ path: '.' }],
+          settings: (existing.settings as Record<string, unknown>) ?? {},
+        };
+      } catch {
+        window.showErrorMessage(`Could not parse existing ${workspaceFileName}.`);
+        return;
+      }
+    } else {
+      workspaceFile = { folders: [{ path: '.' }], settings: {} };
+    }
+
+    // Move any colors already written to the committed settings.json into the workspace file.
+    const movedSettings = extractColorSettingsFromSettingsFile(workspaceRoot);
+    const movedColors = movedSettings['workbench.colorCustomizations'] as Record<string, unknown> | undefined;
+    const existingColors = workspaceFile.settings['workbench.colorCustomizations'] as Record<string, unknown> | undefined;
+    workspaceFile.settings = { ...workspaceFile.settings, ...movedSettings };
+    if (movedColors || existingColors) {
+      workspaceFile.settings['workbench.colorCustomizations'] = { ...existingColors, ...movedColors };
+    }
+
+    try {
+      fs.writeFileSync(workspaceFilePath, JSON.stringify(workspaceFile, null, 2) + '\n');
+    } catch (error) {
+      window.showErrorMessage(`Could not write ${workspaceFileName}: ${error}`);
+      return;
+    }
+
+    const ignored = addToGitExclude(workspaceRoot, workspaceFileName);
+    const ignoreNote = ignored
+      ? `Added it to .git/info/exclude so it stays out of version control.`
+      : `Add "${workspaceFileName}" to your .gitignore so it stays out of version control.`;
+
+    const choice = await window.showInformationMessage(
+      `Created ${workspaceFileName}. ${ignoreNote} Open it now? Window Colors will write colors there, leaving .vscode/settings.json untouched.`,
+      'Open Workspace',
+      'Later');
+    if (choice === 'Open Workspace') {
+      await commands.executeCommand('vscode.openFolder', Uri.file(workspaceFilePath), { forceReuseWindow: true });
+    }
+  });
+
+  context.subscriptions.push(useWorkspaceFileDisposable);
 }
 
 const MAX_LUMINOSITY_ITERATIONS = 500;

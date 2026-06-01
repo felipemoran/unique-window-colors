@@ -47,6 +47,10 @@
       {
         "command": "windowColors.removeColors",
         "title": "Window Colors: Remove Colors from This Window"
+      },
+      {
+        "command": "windowColors.useGitignoredWorkspaceFile",
+        "title": "Window Colors: Move Colors to a Gitignored Workspace File"
       }
     ],
     "configuration": {

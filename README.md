@@ -35,6 +35,19 @@ To avoid checking `.vscode/settings.json` in to your remote repository without m
 
     ```git config --global core.excludesfile ~/.gitignore_global```
 
+## Keep colors out of a committed `settings.json`
+
+If your project **commits** `.vscode/settings.json` (shared team settings), you may not want the generated window colors landing in it. VS Code can only render window tinting from a settings source it loads natively — `.vscode/settings.json`, your user settings, or a `.code-workspace` file — so the colors have to live in one of those. The `.code-workspace` option lets you keep them out of the committed file entirely.
+
+Run **`Window Colors: Move Colors to a Gitignored Workspace File`** from the command palette. It will:
+
+1. Create a `<folder>.code-workspace` file at your project root.
+2. Move any existing window colors out of `.vscode/settings.json` and into that workspace file (leaving the committed file clean).
+3. Add the workspace file to `.git/info/exclude` so it stays out of version control.
+4. Offer to reopen the window using the workspace file.
+
+Once the window is opened as a workspace, all window colors are written to the gitignored `.code-workspace` file instead of `.vscode/settings.json`. This is the same approach popularized by [Peacock](https://www.peacockcode.dev/guide/) for keeping personal colors out of shared settings.
+
 ## Usage
 
 Colors do not get overwritten.  This allows you to set custom colors (or a single Base Color).  To switch between light and dark themed colors, you must first delete the current colors from `.vscode/settings.json`.  You can do this manually or by or selecting `remove` in the extension's `Window Colors: Theme` settings and reloading the VS Code window.
